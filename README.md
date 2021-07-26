@@ -1,5 +1,7 @@
 # mbp-ubuntu-kernel
 
+This repo probably won't be updated, please use https://github.com/AdityaGarg8/mbp-16.x-ubuntu-kernel/releases (probably will be updated faster) or https://github.com/marcosfad/mbp-ubuntu-kernel/releases
+
 Ubuntu/Mint/Debian kernel 5.6+ with Apple T2 patches built-in. This repo will try to keep up with kernel new releases.
 
 This project is closely inspired by mikeeq/mbp-fedora-kernel and marcosfad/mbp-ubuntu-kernel. Thank you @mikeeq and @marcosfad for the scripts and setup. 
