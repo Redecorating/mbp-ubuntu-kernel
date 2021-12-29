@@ -1,0 +1,13 @@
+diff --git a/drivers/bluetooth/btbcm.c b/drivers/bluetooth/btbcm.c
+index 4ecc50d93107..5982b4c9a040 100644
+--- a/drivers/bluetooth/btbcm.c
++++ b/drivers/bluetooth/btbcm.c
+@@ -354,7 +354,7 @@ static int btbcm_read_info(struct hci_dev *hdev)
+ 
+ 	bt_dev_info(hdev, "BCM: chip id %u", skb->data[1]);
+ 
+-	if (skb->data[1] == 150)
++	if ((skb->data[1] == 150)||(skb->data[1] == 133))
+ 		set_bit(HCI_QUIRK_BROKEN_READ_TRANSMIT_POWER, &hdev->quirks);
+ 
+ 	kfree_skb(skb);
