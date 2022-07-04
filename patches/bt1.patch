@@ -23,7 +23,7 @@ index e307074054553a..2f5ca7bc7c14ce 100644
 +config BT_HCIBCM43XX
 +	tristate "HCI BCM43xx PCI driver"
 +	depends on PCI
-+	default ARCH_APPLE
++	default m
 +	help
 +	  Support for Broadcom BCM43xx bluetooth chipsets attached over PCI,
 +	  which are usually found in Apple machines.
