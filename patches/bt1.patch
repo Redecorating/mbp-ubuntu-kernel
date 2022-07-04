@@ -70,7 +70,7 @@ index 00000000000000..4910c5dc1af4f7
 + * just a head and tail pointer. The message from the device is acknowledged
 + * by simple advancing the head of the transfer ring and ringing a doorbell.
 + */
-+
++#define DEBUG
 +// TODO: sort
 +#include <linux/acpi.h>
 +#include <linux/async.h>
