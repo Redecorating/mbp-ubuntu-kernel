@@ -11,18 +11,6 @@ Subject: [PATCH] WIP:/DO-NOT-MERGE: bluetooth
  4 files changed, 1953 insertions(+)
  create mode 100644 drivers/bluetooth/hci_bcm43xx.c
 
-diff --git a/MAINTAINERS b/MAINTAINERS
-index a6d3bd9d2a8d0f..8aef8e6ef668ea 100644
---- a/MAINTAINERS
-+++ b/MAINTAINERS
-@@ -1850,6 +1850,7 @@ F:	drivers/i2c/busses/i2c-pasemi-platform.c
- F:	drivers/iommu/apple-dart.c
- F:	drivers/irqchip/irq-apple-aic.c
- F:	drivers/mailbox/apple-mailbox.c
-+F:	drivers/bluetooth/hci_bcm43xx.c
- F:	drivers/nvme/host/apple.c
- F:	drivers/nvmem/apple-efuses.c
- F:	drivers/pinctrl/pinctrl-apple-gpio.c
 diff --git a/drivers/bluetooth/Kconfig b/drivers/bluetooth/Kconfig
 index e307074054553a..2f5ca7bc7c14ce 100644
 --- a/drivers/bluetooth/Kconfig
