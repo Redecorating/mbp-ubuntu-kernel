@@ -71,7 +71,7 @@ jobs:
           path: /tmp/artifacts/*
 
       - name: Release
-        if: github.ref == 'refs/heads/Mainline'
+        #if: github.ref == 'refs/heads/Mainline'
         uses: softprops/action-gh-release@v1
         with:
           files: |
@@ -80,6 +80,6 @@ jobs:
             /tmp/artifacts/*.deb
           tag_name: v${{ steps.build.outputs.tag }}
           body_path: ${{ github.workspace }}/.github/workflows/instructions.txt
-          draft: false
+          draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

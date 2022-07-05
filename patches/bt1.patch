@@ -1,14 +1,16 @@
-From ae58697c8114c393cfdf5da0a1331a61b3766321 Mon Sep 17 00:00:00 2001
+From 65cfe9d894b27327f43e5ed2a94fdba8fc6e06f9 Mon Sep 17 00:00:00 2001
 From: Sven Peter <sven@svenpeter.dev>
 Date: Fri, 1 Jul 2022 17:21:01 +0200
-Subject: [PATCH] WIP:/DO-NOT-MERGE: bluetooth
+Subject: [PATCH] Bluetooth: hci_bcm43xx: Add new driver for BCM43XX PCI boards
 
+Signed-off-by: Sven Peter <sven@svenpeter.dev>
+redecorating: define debug, remove maintainers hunk so it'll apply on
+5.18, make module by default
 ---
- MAINTAINERS                     |    1 +
  drivers/bluetooth/Kconfig       |   12 +
  drivers/bluetooth/Makefile      |    2 +
- drivers/bluetooth/hci_bcm43xx.c | 1938 +++++++++++++++++++++++++++++++
- 4 files changed, 1953 insertions(+)
+ drivers/bluetooth/hci_bcm43xx.c | 1975 +++++++++++++++++++++++++++++++
+ 3 files changed, 1989 insertions(+)
  create mode 100644 drivers/bluetooth/hci_bcm43xx.c
 
 diff --git a/drivers/bluetooth/Kconfig b/drivers/bluetooth/Kconfig
@@ -49,15 +51,24 @@ index 3321a8aea4a065..2be16bd3c32c0a 100644
  
 diff --git a/drivers/bluetooth/hci_bcm43xx.c b/drivers/bluetooth/hci_bcm43xx.c
 new file mode 100644
-index 00000000000000..4910c5dc1af4f7
+index 00000000000000..700c5594a8a244
 --- /dev/null
 +++ b/drivers/bluetooth/hci_bcm43xx.c
-@@ -0,0 +1,1938 @@
+@@ -0,0 +1,1975 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * Bluetooth HCI driver for Broadcom 43XX devices attached via PCI
 + *
 + * Copyright (C) The Asahi Linux Contributors
++ *
++ * Broadcom BCM43xx PCI devices are combined Wireless LAN/Bluetooth devices
++ * which expose WiFi and Bluetooth as separate PCI functions.
++ *
++ * The Bluetooth function uses a simple IPC protocol based on DMA addressable
++ * shared memory called "Converged IPC" in order to tunnel HCI frames.
++ * Communication between the host and the devices happens over "transfer rings"
++ * and "completion rings" for the separate transport types: Control, HCI,
++ * ACL and SCO.
 + *
 + * The (official) terms "completion ring" and "transfer ring" are a bit
 + * misleading:
@@ -69,23 +80,23 @@ index 00000000000000..4910c5dc1af4f7
 + * ring). The transfer ring for this direction has no memory associated but
 + * just a head and tail pointer. The message from the device is acknowledged
 + * by simple advancing the head of the transfer ring and ringing a doorbell.
++ *
 + */
 +#define DEBUG
-+// TODO: sort
 +#include <linux/acpi.h>
 +#include <linux/async.h>
 +#include <linux/bitfield.h>
-+#include <linux/module.h>
-+#include <linux/firmware.h>
-+#include <linux/dmi.h>
-+#include <linux/of.h>
-+#include <linux/firmware.h>
-+#include <linux/pci.h>
-+#include <linux/msi.h>
-+#include <linux/dma-mapping.h>
 +#include <linux/completion.h>
-+#include <asm/unaligned.h>
++#include <linux/dma-mapping.h>
++#include <linux/dmi.h>
++#include <linux/firmware.h>
++#include <linux/module.h>
++#include <linux/msi.h>
++#include <linux/of.h>
++#include <linux/pci.h>
 +#include <linux/printk.h>
++
++#include <asm/unaligned.h>
 +
 +#include <net/bluetooth/bluetooth.h>
 +#include <net/bluetooth/hci_core.h>
@@ -99,6 +110,19 @@ index 00000000000000..4910c5dc1af4f7
 +#define BCM4377_DEVICE_ID 0x5fa0
 +#define BCM4378_DEVICE_ID 0x5f69
 +#define BCM4387_DEVICE_ID 0x5f71
++
++#define BCM43XX_TIMEOUT 1000
++
++/*
++ * These devices only support DMA transactions inside a 32bit window
++ * (possibly to avoid 64 bit arithmetic). The window size cannot exceed
++ * 0xffffffff but is always aligned down to the previous 0x200 byte boundary
++ * which effectively limits the window to [start, start+0xfffffe00].
++ * On all machines where these devices are present (Apple x86 and arm64
++ * machines) it will always be behind an IOMMU.
++ * We abuse that and just limit the DMA window to [0, 0xfffffe00].
++ */
++#define BCM43XX_DMA_MASK 0xfffffe00
 +
 +/* vendor-specific config space registers */
 +#define BCM43XX_PCIECFG_BAR0_WINDOW0 0x80
@@ -157,10 +181,10 @@ index 00000000000000..4910c5dc1af4f7
 +#define BCM43XX_N_TRANSFER_RINGS 9
 +#define BCM43XX_N_COMPLETION_RINGS 7
 +
-+#define BCM43XX_CIPC_CONTROL_MSG_SIZE 0x34
-+#define BCM43XX_CIPC_HCI_PAYLOAD_SIZE 264
-+#define BCM43XX_CIPC_SCO_PAYLOAD_SIZE 264
-+#define BCM43XX_CIPC_ACL_PAYLOAD_SIZE 0x3f0
++#define BCM43XX_CONTROL_MSG_SIZE 0x34
++#define BCM43XX_HCI_PAYLOAD_SIZE 264
++#define BCM43XX_SCO_PAYLOAD_SIZE 264
++#define BCM43XX_ACL_PAYLOAD_SIZE 0x3f0
 +
 +#define BCM43XX_MAX_RING_SIZE 256
 +
@@ -193,6 +217,8 @@ index 00000000000000..4910c5dc1af4f7
 +	BCM43XX_DOORBELL_ACL_D2H = 4,
 +	BCM43XX_DOORBELL_SCO = 6,
 +};
++
++#define BCM43XX_XFER_RING_MAX_INPLACE_PAYLOAD_SIZE (4 * 0xff)
 +
 +struct bcm43xx_xfer_ring_entry {
 +#define BCM43XX_XFER_RING_FLAG_PAYLOAD_MAPPED BIT(0)
@@ -243,7 +269,7 @@ index 00000000000000..4910c5dc1af4f7
 +	u8 _unk2[10];
 +} __packed;
 +static_assert(sizeof(struct bcm43xx_create_completion_ring_msg) ==
-+	      BCM43XX_CIPC_CONTROL_MSG_SIZE);
++	      BCM43XX_CONTROL_MSG_SIZE);
 +
 +struct bcm43xx_destroy_completion_ring_msg {
 +	u8 msg_type;
@@ -252,7 +278,7 @@ index 00000000000000..4910c5dc1af4f7
 +	u8 _pad1[48];
 +} __packed;
 +static_assert(sizeof(struct bcm43xx_destroy_completion_ring_msg) ==
-+	      BCM43XX_CIPC_CONTROL_MSG_SIZE);
++	      BCM43XX_CONTROL_MSG_SIZE);
 +
 +struct bcm43xx_create_transfer_ring_msg {
 +	u8 msg_type;
@@ -272,7 +298,7 @@ index 00000000000000..4910c5dc1af4f7
 +	u8 _unk2[20];
 +} __packed;
 +static_assert(sizeof(struct bcm43xx_create_transfer_ring_msg) ==
-+	      BCM43XX_CIPC_CONTROL_MSG_SIZE);
++	      BCM43XX_CONTROL_MSG_SIZE);
 +
 +struct bcm43xx_destroy_transfer_ring_msg {
 +	u8 msg_type;
@@ -281,15 +307,16 @@ index 00000000000000..4910c5dc1af4f7
 +	u8 _pad1[48];
 +} __packed;
 +static_assert(sizeof(struct bcm43xx_destroy_transfer_ring_msg) ==
-+	      BCM43XX_CIPC_CONTROL_MSG_SIZE);
++	      BCM43XX_CONTROL_MSG_SIZE);
 +
 +struct bcm43xx_context {
 +	__le16 version;
 +	__le16 size;
 +	__le32 enabled_caps;
 +
-+	/* queue heads and tails */
 +	__le64 per_info_addr;
++
++	/* ring heads and tails */
 +	__le64 completion_ring_heads_addr;
 +	__le64 xfer_ring_tails_addr;
 +	__le64 completion_ring_tails_addr;
@@ -343,6 +370,7 @@ index 00000000000000..4910c5dc1af4f7
 +	enum bcm43xx_transfer_ring_id ring_id;
 +	enum bcm43xx_doorbell doorbell;
 +	u16 payload_size;
++	size_t mapped_payload_size;
 +	u8 completion_ring;
 +	u16 n_entries;
 +	u8 generation;
@@ -354,6 +382,9 @@ index 00000000000000..4910c5dc1af4f7
 +
 +	void *ring;
 +	dma_addr_t ring_dma;
++
++	void *payloads;
++	dma_addr_t payloads_dma;
 +
 +	struct completion **events;
 +	DECLARE_BITMAP(msgids, BCM43XX_MAX_RING_SIZE);
@@ -474,8 +505,6 @@ index 00000000000000..4910c5dc1af4f7
 +
 +	memcpy(skb_put(skb, len), payload, len);
 +	hci_skb_pkt_type(skb) = type;
-+
-+	// TODO: check error?
 +	hci_recv_frame(bcm43xx->hdev, skb);
 +
 +	head = le16_to_cpu(bcm43xx->ring_state->xfer_ring_head[ring->ring_id]);
@@ -650,15 +679,14 @@ index 00000000000000..4910c5dc1af4f7
 +{
 +	unsigned long flags;
 +	struct bcm43xx_xfer_ring_entry *entry;
++	void *payload;
 +	size_t offset;
 +	u16 head, tail, new_head;
 +	u16 raw_msgid;
 +	int ret, msgid;
 +	DECLARE_COMPLETION_ONSTACK(event);
 +
-+	// TODO: just dma_alloc_coherent and BCM43XX_XFER_RING_FLAG_MAPPED
-+	// probably required for large ACL packets
-+	if (len > ring->payload_size)
++	if (len > ring->payload_size && len > ring->mapped_payload_size)
 +		return -EINVAL;
 +	if (wait && !ring->allow_wait)
 +		return -EINVAL;
@@ -695,8 +723,18 @@ index 00000000000000..4910c5dc1af4f7
 +	memset(entry, 0, sizeof(*entry));
 +	entry->id = cpu_to_le16(raw_msgid);
 +	entry->len = cpu_to_le16(len);
-+	entry->flags = BCM43XX_XFER_RING_FLAG_PAYLOAD_IN_FOOTER;
-+	memcpy(ring->ring + offset + sizeof(*entry), data, len);
++
++	if (len <= ring->payload_size) {
++		entry->flags = BCM43XX_XFER_RING_FLAG_PAYLOAD_IN_FOOTER;
++		payload = ring->ring + offset + sizeof(*entry);
++	} else {
++		entry->flags = BCM43XX_XFER_RING_FLAG_PAYLOAD_MAPPED;
++		entry->payload = cpu_to_le64(ring->payloads_dma +
++					     msgid * ring->mapped_payload_size);
++		payload = ring->payloads + msgid * ring->mapped_payload_size;
++	}
++
++	memcpy(payload, data, len);
 +
 +	if (wait)
 +		ring->events[msgid] = &event;
@@ -716,7 +754,8 @@ index 00000000000000..4910c5dc1af4f7
 +	spin_unlock_irqrestore(&ring->lock, flags);
 +
 +	if (ret == 0 && wait) {
-+		ret = wait_for_completion_interruptible_timeout(&event, 1000);
++		ret = wait_for_completion_interruptible_timeout(
++			&event, BCM43XX_TIMEOUT);
 +		if (ret == 0)
 +			ret = -ETIMEDOUT;
 +		else if (ret > 0)
@@ -898,7 +937,7 @@ index 00000000000000..4910c5dc1af4f7
 +	return 0;
 +}
 +
-+static int bcm43xx_bcm4378_send_calibration(struct bcm43xx_data *bcm43xx)
++static int bcm4378_send_calibration(struct bcm43xx_data *bcm43xx)
 +{
 +	if (strcmp(bcm43xx->stepping, "b1") == 0)
 +		return bcm43xx_send_calibration(
@@ -910,7 +949,7 @@ index 00000000000000..4910c5dc1af4f7
 +						bcm43xx->taurus_cal_size);
 +}
 +
-+static int bcm43xx_bcm4387_send_calibration(struct bcm43xx_data *bcm43xx)
++static int bcm4387_send_calibration(struct bcm43xx_data *bcm43xx)
 +{
 +	if (strcmp(bcm43xx->stepping, "c2") == 0)
 +		return bcm43xx_send_calibration(
@@ -929,16 +968,16 @@ index 00000000000000..4910c5dc1af4f7
 +	char name[256];
 +	int ret;
 +
-+	snprintf(name, sizeof(name), "brcmbt%s%s-%s-%s.%s", bcm43xx->hw->name,
-+		 bcm43xx->stepping, bcm43xx->board_type, bcm43xx->vendor,
-+		 suffix);
++	snprintf(name, sizeof(name), "brcm/brcmbt%s%s-%s-%s.%s",
++		 bcm43xx->hw->name, bcm43xx->stepping, bcm43xx->board_type,
++		 bcm43xx->vendor, suffix);
 +	dev_info(&bcm43xx->pdev->dev, "Trying to load '%s'", name);
 +
 +	ret = request_firmware(&fw, name, &bcm43xx->pdev->dev);
 +	if (!ret)
 +		return fw;
 +
-+	snprintf(name, sizeof(name), "brcmbt%s%s-%s.%s", bcm43xx->hw->name,
++	snprintf(name, sizeof(name), "brcm/brcmbt%s%s-%s.%s", bcm43xx->hw->name,
 +		 bcm43xx->stepping, bcm43xx->board_type, suffix);
 +	ret = request_firmware(&fw, name, &bcm43xx->pdev->dev);
 +	dev_info(&bcm43xx->pdev->dev, "Trying to load '%s'", name);
@@ -1063,6 +1102,7 @@ index 00000000000000..4910c5dc1af4f7
 +destroy_hci_acl_ack:
 +	bcm43xx_destroy_completion_ring(bcm43xx, &bcm43xx->hci_acl_ack_ring);
 +
++	dev_warn(&bcm43xx->pdev->dev, "Creating rings failed with %d\n", ret);
 +	return ret;
 +}
 +
@@ -1168,11 +1208,12 @@ index 00000000000000..4910c5dc1af4f7
 +	size_t entry_size;
 +
 +	spin_lock_init(&ring->lock);
++	ring->payload_size = ALIGN(ring->payload_size, 4);
++	if (ring->payload_size > BCM43XX_XFER_RING_MAX_INPLACE_PAYLOAD_SIZE)
++		return -EINVAL;
 +	if (ring->n_entries > BCM43XX_MAX_RING_SIZE)
 +		return -EINVAL;
 +	if (ring->virtual && ring->allow_wait)
-+		return -EINVAL;
-+	if (ring->payload_size % 4)
 +		return -EINVAL;
 +	if (ring->virtual)
 +		return 0;
@@ -1192,6 +1233,16 @@ index 00000000000000..4910c5dc1af4f7
 +		if (!ring->events)
 +			return -ENOMEM;
 +	}
++
++	if (ring->mapped_payload_size) {
++		ring->payloads = dmam_alloc_coherent(
++			&bcm43xx->pdev->dev,
++			ring->n_entries * ring->mapped_payload_size,
++			&ring->payloads_dma, GFP_KERNEL);
++		if (!ring->payloads)
++			return -ENOMEM;
++	}
++
 +	return 0;
 +}
 +
@@ -1200,9 +1251,10 @@ index 00000000000000..4910c5dc1af4f7
 +{
 +	size_t entry_size;
 +
-+	if (ring->n_entries > BCM43XX_MAX_RING_SIZE)
++	ring->payload_size = ALIGN(ring->payload_size, 4);
++	if (ring->payload_size > BCM43XX_XFER_RING_MAX_INPLACE_PAYLOAD_SIZE)
 +		return -EINVAL;
-+	if (ring->payload_size % 4)
++	if (ring->n_entries > BCM43XX_MAX_RING_SIZE)
 +		return -EINVAL;
 +
 +	entry_size = ring->payload_size +
@@ -1296,7 +1348,7 @@ index 00000000000000..4910c5dc1af4f7
 +	 * what we configure here).
 +	 */
 +	bcm43xx->control_ack_ring.ring_id = BCM43XX_ACK_RING_CONTROL;
-+	bcm43xx->control_ack_ring.n_entries = 128;
++	bcm43xx->control_ack_ring.n_entries = 32;
 +	bcm43xx->control_ack_ring.transfer_rings =
 +		BIT(BCM43XX_XFER_RING_CONTROL);
 +
@@ -1308,7 +1360,7 @@ index 00000000000000..4910c5dc1af4f7
 +
 +	bcm43xx->hci_acl_event_ring.ring_id = BCM43XX_EVENT_RING_HCI_ACL;
 +	// TODO: this is just a max-sized HCI frame, but small for ACL?
-+	bcm43xx->hci_acl_event_ring.payload_size = 4 * 66;
++	bcm43xx->hci_acl_event_ring.payload_size = HCI_MAX_EVENT_SIZE;
 +	bcm43xx->hci_acl_event_ring.n_entries = 256;
 +	bcm43xx->hci_acl_event_ring.transfer_rings =
 +		BIT(BCM43XX_XFER_RING_HCI_D2H) | BIT(BCM43XX_XFER_RING_ACL_D2H);
@@ -1319,22 +1371,20 @@ index 00000000000000..4910c5dc1af4f7
 +	bcm43xx->sco_ack_ring.transfer_rings = BIT(BCM43XX_XFER_RING_SCO_H2D);
 +
 +	bcm43xx->sco_event_ring.ring_id = BCM43XX_EVENT_RING_SCO;
-+	// TODO: this is just a max-sized SCO frame
-+	bcm43xx->sco_event_ring.payload_size = 4 * 66;
++	bcm43xx->sco_event_ring.payload_size = HCI_MAX_SCO_SIZE;
 +	bcm43xx->sco_event_ring.n_entries = 128;
 +	bcm43xx->sco_event_ring.transfer_rings = BIT(BCM43XX_XFER_RING_SCO_D2H);
 +
 +	bcm43xx->control_h2d_ring.ring_id = BCM43XX_XFER_RING_CONTROL;
 +	bcm43xx->control_h2d_ring.doorbell = BCM43XX_DOORBELL_CONTROL;
-+	bcm43xx->control_h2d_ring.payload_size = BCM43XX_CIPC_CONTROL_MSG_SIZE;
++	bcm43xx->control_h2d_ring.payload_size = BCM43XX_CONTROL_MSG_SIZE;
 +	bcm43xx->control_h2d_ring.completion_ring = BCM43XX_ACK_RING_CONTROL;
 +	bcm43xx->control_h2d_ring.allow_wait = true;
 +	bcm43xx->control_h2d_ring.n_entries = 128;
 +
 +	bcm43xx->hci_h2d_ring.ring_id = BCM43XX_XFER_RING_HCI_H2D;
 +	bcm43xx->hci_h2d_ring.doorbell = BCM43XX_DOORBELL_HCI_H2D;
-+	// TODO: this is just a max-sized HCI frame, what about ACL though?
-+	bcm43xx->hci_h2d_ring.payload_size = 4 * 66;
++	bcm43xx->hci_h2d_ring.payload_size = HCI_MAX_EVENT_SIZE;
 +	bcm43xx->hci_h2d_ring.completion_ring = BCM43XX_ACK_RING_HCI_ACL;
 +	bcm43xx->hci_h2d_ring.n_entries = 128;
 +
@@ -1346,8 +1396,7 @@ index 00000000000000..4910c5dc1af4f7
 +
 +	bcm43xx->sco_h2d_ring.ring_id = BCM43XX_XFER_RING_SCO_H2D;
 +	bcm43xx->sco_h2d_ring.doorbell = BCM43XX_DOORBELL_SCO;
-+	// TODO: this is just a max-sized SCO frame
-+	bcm43xx->sco_h2d_ring.payload_size = 4 * 66;
++	bcm43xx->sco_h2d_ring.payload_size = HCI_MAX_SCO_SIZE;
 +	bcm43xx->sco_h2d_ring.completion_ring = BCM43XX_ACK_RING_SCO;
 +	bcm43xx->sco_h2d_ring.sync = true;
 +	bcm43xx->sco_h2d_ring.n_entries = 128;
@@ -1361,8 +1410,11 @@ index 00000000000000..4910c5dc1af4f7
 +
 +	bcm43xx->acl_h2d_ring.ring_id = BCM43XX_XFER_RING_ACL_H2D;
 +	bcm43xx->acl_h2d_ring.doorbell = BCM43XX_DOORBELL_ACL_H2D;
-+	// TODO: this almost fits a max-size ACL frame
-+	bcm43xx->acl_h2d_ring.payload_size = 4 * 252;
++	/*
++	 * mapped_payload_size because the largest ACL packet doesn't
++	 * fit inside the largest possible footer
++	 */
++	bcm43xx->acl_h2d_ring.mapped_payload_size = HCI_MAX_FRAME_SIZE;
 +	bcm43xx->acl_h2d_ring.completion_ring = BCM43XX_ACK_RING_HCI_ACL;
 +	bcm43xx->acl_h2d_ring.n_entries = 128;
 +
@@ -1420,22 +1472,6 @@ index 00000000000000..4910c5dc1af4f7
 +	return 0;
 +}
 +
-+static int bcm43xx_setup_msi(struct bcm43xx_data *bcm43xx)
-+{
-+	struct msi_msg msi_msg;
-+	int ret;
-+
-+	ret = irq_chip_compose_msi_msg(irq_get_irq_data(bcm43xx->irq),
-+				       &msi_msg);
-+	if (ret)
-+		return ret;
-+
-+	iowrite32(msi_msg.address_lo, bcm43xx->bar0 + BCM43XX_BAR0_MSI_ADDR_LO);
-+	iowrite32(msi_msg.address_hi, bcm43xx->bar0 + BCM43XX_BAR0_MSI_ADDR_HI);
-+
-+	return 0;
-+}
-+
 +static int bcm43xx_boot(struct bcm43xx_data *bcm43xx)
 +{
 +	u32 bootstage;
@@ -1457,18 +1493,18 @@ index 00000000000000..4910c5dc1af4f7
 +
 +	memcpy(bfr, fw->data, fw->size);
 +
-+	/* we're behind an IOMMU and can just allow the entire IOVA space */
-+	// TODO: double check if this is always correct; it probably is since we don't call dma_set_mask_and_coherent
 +	iowrite32(0, bcm43xx->bar0 + BCM43XX_BAR0_HOST_WINDOW_LO);
 +	iowrite32(0, bcm43xx->bar0 + BCM43XX_BAR0_HOST_WINDOW_HI);
-+	iowrite32(0xffffffff, bcm43xx->bar0 + BCM43XX_BAR0_HOST_WINDOW_SIZE);
++	iowrite32(BCM43XX_DMA_MASK,
++		  bcm43xx->bar0 + BCM43XX_BAR0_HOST_WINDOW_SIZE);
 +
 +	iowrite32(lower_32_bits(fw_dma), bcm43xx->bar2 + BCM43XX_BAR2_FW_LO);
 +	iowrite32(upper_32_bits(fw_dma), bcm43xx->bar2 + BCM43XX_BAR2_FW_HI);
 +	iowrite32(fw->size, bcm43xx->bar2 + BCM43XX_BAR2_FW_SIZE);
 +	iowrite32(0, bcm43xx->bar0 + BCM43XX_BAR0_FW_DOORBELL);
 +
-+	ret = wait_for_completion_interruptible_timeout(&bcm43xx->event, 1000);
++	ret = wait_for_completion_interruptible_timeout(&bcm43xx->event,
++							BCM43XX_TIMEOUT);
 +	if (ret == 0) {
 +		ret = -ETIMEDOUT;
 +		goto out_dma_free;
@@ -1478,7 +1514,7 @@ index 00000000000000..4910c5dc1af4f7
 +
 +	bootstage = ioread32(bcm43xx->bar2 + BCM43XX_BAR2_BOOTSTAGE);
 +	if (bootstage != 2) {
-+		dev_err(&bcm43xx->pdev->dev, "boostage (%x) != 2\n", bootstage);
++		dev_err(&bcm43xx->pdev->dev, "boostage %d != 2\n", bootstage);
 +		ret = -ENXIO;
 +		goto out_dma_free;
 +	}
@@ -1497,23 +1533,13 @@ index 00000000000000..4910c5dc1af4f7
 +static int bcm43xx_setup_rti(struct bcm43xx_data *bcm43xx)
 +{
 +	u32 rti_status;
-+	struct msi_msg msi_msg;
 +	int ret;
 +
-+	ret = irq_chip_compose_msi_msg(irq_get_irq_data(bcm43xx->irq),
-+				       &msi_msg);
-+	if (ret)
-+		return ret;
-+
-+	/* setup and start RTI (?) */
-+	iowrite32(msi_msg.address_lo,
-+		  bcm43xx->bar2 + BCM43XX_BAR2_RTI_MSI_ADDR_LO);
-+	iowrite32(msi_msg.address_hi,
-+		  bcm43xx->bar2 + BCM43XX_BAR2_RTI_MSI_ADDR_HI);
-+	iowrite32(msi_msg.data, bcm43xx->bar2 + BCM43XX_BAR2_RTI_MSI_DATA);
++	/* start RTI */
 +	iowrite32(1, bcm43xx->bar0 + BCM43XX_BAR0_RTI_CONTROL);
 +
-+	ret = wait_for_completion_interruptible_timeout(&bcm43xx->event, 1000);
++	ret = wait_for_completion_interruptible_timeout(&bcm43xx->event,
++							BCM43XX_TIMEOUT);
 +	if (ret == 0) {
 +		dev_err(&bcm43xx->pdev->dev,
 +			"timed out while waiting for RTI to transition to state 1");
@@ -1533,7 +1559,8 @@ index 00000000000000..4910c5dc1af4f7
 +	/* allow access to the entire IOVA space again */
 +	iowrite32(0, bcm43xx->bar2 + BCM43XX_BAR2_RTI_WINDOW_LO);
 +	iowrite32(0, bcm43xx->bar2 + BCM43XX_BAR2_RTI_WINDOW_HI);
-+	iowrite32(0xffffffff, bcm43xx->bar2 + BCM43XX_BAR2_RTI_WINDOW_SIZE);
++	iowrite32(BCM43XX_DMA_MASK,
++		  bcm43xx->bar2 + BCM43XX_BAR2_RTI_WINDOW_SIZE);
 +
 +	/* setup "Converged IPC" context */
 +	iowrite32(lower_32_bits(bcm43xx->ctx_dma),
@@ -1542,7 +1569,8 @@ index 00000000000000..4910c5dc1af4f7
 +		  bcm43xx->bar2 + BCM43XX_BAR2_CONTEXT_ADDR_HI);
 +	iowrite32(2, bcm43xx->bar0 + BCM43XX_BAR0_RTI_CONTROL);
 +
-+	ret = wait_for_completion_interruptible_timeout(&bcm43xx->event, 1000);
++	ret = wait_for_completion_interruptible_timeout(&bcm43xx->event,
++							BCM43XX_TIMEOUT);
 +	if (ret == 0) {
 +		dev_err(&bcm43xx->pdev->dev,
 +			"timed out while waiting for RTI to transition to state 2");
@@ -1559,7 +1587,7 @@ index 00000000000000..4910c5dc1af4f7
 +	}
 +
 +	dev_dbg(&bcm43xx->pdev->dev,
-+		"RTI is in state 2; control pipe is ready\n");
++		"RTI is in state 2; control ring is ready\n");
 +	bcm43xx->control_ack_ring.enabled = true;
 +
 +	return 0;
@@ -1785,12 +1813,11 @@ index 00000000000000..4910c5dc1af4f7
 +{
 +	struct device_node *np = bcm43xx->pdev->dev.of_node;
 +
-+	if (!np)
-+		return -ENOENT;
-+
 +	if (of_property_read_string(np, "brcm,board-type",
-+				    &bcm43xx->board_type))
++				    &bcm43xx->board_type)) {
++		dev_dbg(&bcm43xx->pdev->dev, "no brcm,board-type property\n");
 +		return -ENOENT;
++	}
 +
 +	bcm43xx->taurus_beamforming_cal_blob =
 +		of_get_property(np, "brcm,taurus-bf-cal-blob",
@@ -1806,18 +1833,24 @@ index 00000000000000..4910c5dc1af4f7
 +	const union acpi_object *o;
 +	struct device *dev = &bcm43xx->pdev->dev;
 +	struct acpi_device *adev = ACPI_COMPANION(dev);
++	int ret;
 +
 +	if (!adev)
 +		return -ENOENT;
 +
-+	if (!ACPI_FAILURE(acpi_dev_get_property(adev, "module-instance",
-+						ACPI_TYPE_STRING, &o))) {
-+		dev_dbg(dev, "ACPI module-instance=%s\n", o->string.pointer);
-+		bcm43xx->board_type = devm_kasprintf(
-+			dev, GFP_KERNEL, "apple,%s", o->string.pointer);
-+	} else {
++	ret = acpi_dev_get_property(adev, "module-instance", ACPI_TYPE_STRING,
++				    &o);
++	if (ret) {
++		dev_err(dev, "no ACPI module-instance\n");
 +		return -ENOENT;
 +	}
++
++	dev_dbg(dev, "ACPI module-instance=%s\n", o->string.pointer);
++
++	bcm43xx->board_type =
++		devm_kasprintf(dev, GFP_KERNEL, "apple,%s", o->string.pointer);
++	if (!bcm43xx->board_type)
++		return -ENOMEM;
 +
 +	return 0;
 +}
@@ -1829,6 +1862,10 @@ index 00000000000000..4910c5dc1af4f7
 +	struct bcm43xx_data *bcm43xx;
 +	struct hci_dev *hdev;
 +	int ret;
++
++	ret = dma_set_mask_and_coherent(&pdev->dev, BCM43XX_DMA_MASK);
++	if (ret)
++		return ret;
 +
 +	bcm43xx = devm_kzalloc(&pdev->dev, sizeof(*bcm43xx), GFP_KERNEL);
 +	if (!bcm43xx)
@@ -1848,10 +1885,16 @@ index 00000000000000..4910c5dc1af4f7
 +
 +	if (pdev->dev.of_node)
 +		ret = bcm43xx_probe_of(bcm43xx);
-+	else
++	else if (ACPI_HANDLE(&pdev->dev))
 +		ret = bcm43xx_probe_acpi(bcm43xx);
-+	if (ret)
++	else {
++		dev_err(&pdev->dev, "device is neither OF nor ACPI\n");
++		return -ENODEV;
++	}
++	if (ret) {
++		dev_err(&pdev->dev, "unable to determine board type\n");
 +		return ret;
++	}
 +
 +	ret = pci_enable_device(pdev);
 +	if (ret)
@@ -1913,10 +1956,6 @@ index 00000000000000..4910c5dc1af4f7
 +	hci_set_drvdata(hdev, bcm43xx);
 +	SET_HCIDEV_DEV(hdev, &pdev->dev);
 +
-+	ret = bcm43xx_setup_msi(bcm43xx);
-+	if (ret)
-+		return ret;
-+
 +	ret = bcm43xx_boot(bcm43xx);
 +	if (ret)
 +		return ret;
@@ -1949,7 +1988,7 @@ index 00000000000000..4910c5dc1af4f7
 +		.bar0_window5 = 0x18107000,
 +		.has_bar0_window5 = true,
 +		.m2m_reset_on_ss_reset_disabled = false,
-+		.send_calibration = bcm43xx_bcm4378_send_calibration,
++		.send_calibration = bcm4378_send_calibration,
 +	},
 +
 +	[BCM4387]= {
@@ -1959,7 +1998,7 @@ index 00000000000000..4910c5dc1af4f7
 +		.bar0_window5 = 0x18106000,
 +		.has_bar0_window5 = true,
 +		.m2m_reset_on_ss_reset_disabled = true,
-+		.send_calibration = bcm43xx_bcm4387_send_calibration,
++		.send_calibration = bcm4387_send_calibration,
 +	},
 +};
 +
@@ -1989,5 +2028,5 @@ index 00000000000000..4910c5dc1af4f7
 +MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
 +MODULE_DESCRIPTION("Bluetooth support for Broadcom 43XX PCIe devices");
 +MODULE_LICENSE("GPL");
-+MODULE_FIRMWARE("brcmbt*.bin");
-+MODULE_FIRMWARE("brcmbt*.ptb");
++MODULE_FIRMWARE("brcm/brcmbt43*.bin");
++MODULE_FIRMWARE("brcm/brcmbt43*.ptb");
